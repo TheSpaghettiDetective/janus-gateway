@@ -727,6 +727,7 @@ json_t *janus_streaming_handle_admin_message(json_t *message);
 void janus_streaming_setup_media(janus_plugin_session *handle);
 void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
+void janus_streaming_incoming_data(janus_plugin_session *handle, char *label, gboolean textdata, char *buf, int len);
 void janus_streaming_hangup_media(janus_plugin_session *handle);
 void janus_streaming_destroy_session(janus_plugin_session *handle, int *error);
 json_t *janus_streaming_query_session(janus_plugin_session *handle);
@@ -752,6 +753,7 @@ static janus_plugin janus_streaming_plugin =
 		.setup_media = janus_streaming_setup_media,
 		.incoming_rtp = janus_streaming_incoming_rtp,
 		.incoming_rtcp = janus_streaming_incoming_rtcp,
+		.incoming_data = janus_streaming_incoming_data,
 		.hangup_media = janus_streaming_hangup_media,
 		.destroy_session = janus_streaming_destroy_session,
 		.query_session = janus_streaming_query_session,
@@ -7592,4 +7594,53 @@ static void *janus_streaming_helper_thread(void *data) {
 	janus_mutex_unlock(&mp->mutex);
 	janus_refcount_decrease(&mp->ref);
 	return NULL;
+}
+
+void janus_streaming_incoming_data(janus_plugin_session *handle, char *label, gboolean textdata, char *buf, int len) {
+	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	if(!textdata) {
+		/* We don't support binary data in the TextRoom plugin, it has to be text */
+		JANUS_LOG(LOG_ERR, "Binary data received, dropping...\n");
+		return;
+	}
+	/* Incoming request from this user: what should we do? */
+	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;
+	if(!session) {
+		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+		return;
+	}
+	janus_refcount_increase(&session->ref);
+	if(session->destroyed) {
+		janus_refcount_decrease(&session->ref);
+		return;
+	}
+	if(buf == NULL || len <= 0) {
+		janus_refcount_decrease(&session->ref);
+		return;
+	}
+	char *text = g_malloc(len+1);
+	memcpy(text, buf, len);
+	*(text+len) = '\0';
+	JANUS_LOG(LOG_VERB, "Got a DataChannel message (%zu bytes): %s\n", strlen(text), text);
+
+	json_error_t error;
+	json_t *root = json_loads(text, 0, &error);
+	g_free(text);
+
+	if(!root) {
+		JANUS_LOG(LOG_ERR, "Error parsing data channel message (JSON error: on line %d: %s)\n", error.line, error.text);
+		janus_refcount_decrease(&session->ref);
+		return;
+	}
+
+	/* Prepare JSON event */
+	json_t *event = json_object();
+	json_object_set_new(event, "streaming", json_string("event"));
+	json_object_set_new(event, "thespaghettidetective", root);
+	int ret = gateway->push_event(handle, &janus_streaming_plugin, NULL, event, NULL);
+	JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+	json_decref(event);
+
+	janus_refcount_decrease(&session->ref);
 }
